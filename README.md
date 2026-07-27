@@ -89,7 +89,7 @@ graph TD
 
 - **Threading Architecture**: Single-threaded. `apparmor_parse.sh` is a shell script executed once as a systemd oneshot service. `apparmor_cicd.py` is a single-threaded Python program.
 - **Main Thread**: Sequential execution — read blocklist, read defaults, build lists, invoke `apparmor_parser`, read sysfs, emit telemetry.
-- **Synchronization**: Systemd service ordering (`Before=lighttpd.service`, `local-fs.target`) ensures profiles are fully loaded before any profiled process is started.
+- **Synchronization**: Systemd service ordering (`Before=lighttpd.service`, `WantedBy=local-fs.target`) ensures profiles are loaded before `lighttpd.service` starts; other services must be ordered after `apparmor.service` by the platform/integration to guarantee the same.
 - **Execution model**: Sequential oneshot — the service runs to completion at boot and exits after profile loading is done.
 
 ---
