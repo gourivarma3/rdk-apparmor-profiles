@@ -198,7 +198,7 @@ flowchart TD
 
 ### 1. Install profiles
 
-Profile files from `generic_profiles/` are installed into `/etc/apparmor/binprofiles/` as part of the RDK image build. `apparmor.service` is installed into the systemd unit directory.
+Profile files from `generic_profiles/` are installed into `/etc/apparmor/binprofiles/*/` (enforce-mode paths) and `/etc/apparmor.d/` (complain-mode paths) as part of the RDK image build. `apparmor.service` is installed into the systemd unit directory.
 
 ### 2. Enable and start the service
 
