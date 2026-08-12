@@ -12,18 +12,18 @@ At the module level, this component delivers: `apparmor.service` — a systemd o
 
 ```mermaid
 graph TD
-    AppLayer["Application Layer\n(Lightning / WebApp / Native Apps)"]
-    FireboltLayer["Firebolt Layer\n(Firebolt SDK / APIs)"]
-    ThunderLayer["Thunder / WPEFramework Layer\n(WPEFramework, WPEProcess, Thunder Plugins)"]
-    RDKCoreLayer["RDK Core Layer\n(IARMDaemonMain, dsMgrMain, pwrMgrMain,\ntr69hostif, parodus, telemetry2_0, etc.)"]
-    ApparmorComp["rdk-apparmor-profiles\n(systemd oneshot service)"]
-    KernelLayer["Linux Kernel\n(AppArmor LSM)"]
-    Telemetry["Telemetry 2.0\n(t2ValNotify)"]
+    AppLayer["Application Layer<br/>(Lightning / WebApp / Native Apps)"]
+    FireboltLayer["Firebolt Layer<br/>(Firebolt SDK / APIs)"]
+    ThunderLayer["Thunder / WPEFramework Layer<br/>(WPEFramework, WPEProcess, Thunder Plugins)"]
+    RDKCoreLayer["RDK Core Layer<br/>(IARMDaemonMain, dsMgrMain, pwrMgrMain,<br/>tr69hostif, parodus, telemetry2_0, etc.)"]
+    ApparmorComp["rdk-apparmor-profiles<br/>(systemd oneshot service)"]
+    KernelLayer["Linux Kernel<br/>(AppArmor LSM)"]
+    Telemetry["Telemetry 2.0<br/>(t2ValNotify)"]
 
     AppLayer --> ThunderLayer
     FireboltLayer --> ThunderLayer
     ThunderLayer --> RDKCoreLayer
-    ApparmorComp -->|"apparmor_parser -rW[B] / -rWC"| KernelLayer
+    ApparmorComp -->|"apparmor_parser -rW(B) / -rWC"| KernelLayer
     KernelLayer -->|"Enforces profiles on"| ThunderLayer
     KernelLayer -->|"Enforces profiles on"| RDKCoreLayer
     ApparmorComp -->|"t2ValNotify APPARMOR_C_split / APPARMOR_E_split"| Telemetry
