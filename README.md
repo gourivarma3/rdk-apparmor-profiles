@@ -6,9 +6,9 @@
 
 `rdk-apparmor-profiles` is an RDK-E/RDK-V platform component that provides AppArmor Mandatory Access Control security profiles for RDK daemons and services. AppArmor is a Linux kernel security module that confines processes to a defined set of permitted resources. This repository contains the per-process profile files, the systemd service unit that triggers profile loading at boot, the shell script that performs mode resolution and loading, and a Python-based CI/CD tool that detects security violations in profile changes.
 
-At the device level, this component enforces access restrictions on RDK daemons and services, including middleware services (`IARMDaemonMain`, `dsMgrMain`, `pwrMgrMain`, `tr69hostif`, `parodus`, `webconfig`) and the WPEFramework processes (`WPEFramework`, `WPEProcess`). Each process is confined to the files, capabilities, and kernel objects explicitly listed in its profile. A profile operates in either `enforce` mode (violations are denied and logged by the kernel) or `complain` mode (violations are logged but not denied). An operator-writable blocklist at `/opt/secure/Apparmor_blocklist` allows per-process mode override at runtime without reflashing.
+At the device level, this component enforces access restrictions on RDK daemons and services, including middleware services (`IARMDaemonMain`, `dsMgrMain`, `pwrMgrMain`, `tr69hostif`, `parodus`, `webconfig`) and the WPEFramework processes (`WPEFramework`, `WPEProcess`). Each process is confined to the files, capabilities, and kernel objects explicitly listed in its profile. A profile operates in either `enforce` mode (violations are denied and logged by the kernel) or `complain` mode (violations are logged but not denied). Profile modes are selected at image build time; runtime blocklist overrides are not used.
 
-At the module level, this component delivers: `apparmor.service` — a systemd oneshot unit that loads profiles before other services start; `apparmor_parse.sh` — a shell script that reads the defaults file and blocklist, resolves the effective mode for each process, invokes `apparmor_parser`, and emits telemetry; a set of named per-daemon profile files under `generic_profiles/`; and `apparmor_cicd.py` — a Python security violation checker used in CI via a GitHub Actions workflow.
+At the module level, this component delivers: `apparmor.service` — a systemd oneshot unit that loads profiles before other services start; `apparmor_parse.sh` — a shell script that reads the build-time defaults file, loads the generated binary profiles, and emits telemetry; a set of named per-daemon profile sources under `generic_profiles/`; and `apparmor_cicd.py` — a Python security violation checker used in CI via a GitHub Actions workflow.
 
 ```mermaid
 graph TD
@@ -23,7 +23,7 @@ graph TD
     AppLayer --> ThunderLayer
     FireboltLayer --> ThunderLayer
     ThunderLayer --> RDKCoreLayer
-    ApparmorComp -->|"apparmor_parser -rW(B) / -rWC"| KernelLayer
+    ApparmorComp -->|"loads build-time binary profiles"| KernelLayer
     KernelLayer -->|"Enforces profiles on"| ThunderLayer
     KernelLayer -->|"Enforces profiles on"| RDKCoreLayer
     ApparmorComp -->|"t2ValNotify APPARMOR_C_split / APPARMOR_E_split"| Telemetry
@@ -32,7 +32,7 @@ graph TD
 **Key Features & Responsibilities:**
 
 - **Per-process AppArmor profiles**: Each RDK daemon has a named profile file in `generic_profiles/` that lists allowed files (with `r`, `w`, `m`, `x` permissions), Linux capabilities, network access, signal, ptrace, dbus, and unix rules. The `flags=(attach_disconnected)` flag is present on all profiles.
-- **Blocklist-driven mode override**: `/opt/secure/Apparmor_blocklist` is read at service start and can override the default mode (`enforce`, `complain`, or `disable`) for any individual process without modifying profile files or rootfs.
+- **Build-time profile generation**: Profile sources are converted to binary form during the RDK image build, so boot-time loading can use the generated binaries without compiling profiles on the target.
 - **Vendor profile extension**: Profiles may optionally include `#include if exists "/etc/apparmor.d/vendor/<profile>"`, allowing platform-specific additions to be layered over generic profiles without modifying the base files.
 - **Telemetry reporting**: After loading profiles, `apparmor_parse.sh` reads `/sys/kernel/security/apparmor/profiles`, counts processes in each mode, and calls `t2ValNotify "APPARMOR_C_split:"` and `t2ValNotify "APPARMOR_E_split:"` with the count and process name list.
 - **CI/CD security violation detection**: `apparmor_cicd.py` and `.github/workflows/apparmor_violation_check.yml` check every changed profile file in a pull request against a defined `check_list` of 20 `SecurityCheckRule` entries and fail the CI job if new violations are introduced.
@@ -44,13 +44,13 @@ graph TD
 
 ### High-Level Architecture
 
-The component is structured into three distinct parts: startup infrastructure, policy files, and development tooling. These parts operate independently — the startup infrastructure runs once at boot, the policy files are static data installed into the rootfs, and the development tooling runs only in CI. The startup infrastructure consists of `apparmor.service` and `apparmor_parse.sh`. The service unit declares ordering constraints and guards, then delegates all work to the shell script. The shell script reads two configuration files, resolves per-process modes, and invokes `apparmor_parser` twice — once for the complain-mode batch and once for the enforce-mode batch.
+The component is structured into three distinct parts: startup infrastructure, policy sources, and development tooling. These parts operate independently — the startup infrastructure runs once at boot, the policy sources are converted to binary profiles during the image build, and the development tooling runs only in CI. The startup infrastructure consists of `apparmor.service` and `apparmor_parse.sh`. The service unit declares ordering constraints and guards, then delegates loading to the shell script. The shell script reads the build-time defaults and loads the generated binary profiles.
 
 Northbound, the component integrates with systemd via a oneshot unit. `apparmor.service` declares `Before=lighttpd.service` and `WantedBy=local-fs.target`. The `DefaultDependencies=no` directive prevents implicit systemd ordering from interfering. The unit skips silently if `ConditionSecurity=apparmor` fails (AppArmor not enabled in kernel) or if `ConditionPathExists=/etc/apparmor.d` fails. It fails with an assertion error if `AssertPathIsReadWrite=/sys/kernel/security/apparmor/.load` is not satisfied. Southbound, the component calls `apparmor_parser` to load compiled profiles into the kernel. Loaded policies are then enforced by the kernel's AppArmor LSM against all covered processes for the duration of the system session.
 
-`apparmor_parse.sh` calls `t2ValNotify` from `/lib/rdk/t2Shared_api.sh` (sourced if the file is present) for one-way telemetry after profile loading completes. Runtime communication is limited to this telemetry call; all other interactions are file-based reads and writes.
+`apparmor_parse.sh` calls `t2ValNotify` from `/lib/rdk/t2Shared_api.sh` (sourced if the file is present) for one-way telemetry after profile loading completes. Runtime communication is limited to this telemetry call; profile selection and compilation are completed during the image build.
 
-The only persistent runtime configuration file is `/opt/secure/Apparmor_blocklist`, which resides in writable storage and survives reboots. All profile files and the defaults file are part of the read-only rootfs and remain unchanged at runtime. The blocklist file is created empty by `touch` in `apparmor_parse.sh` if it does not exist at service start.
+There is no supported runtime profile configuration file. Profile sources, generated binaries, and the defaults file are packaged in the image and remain unchanged at runtime. Legacy blocklist handling retained in `apparmor_parse.sh` is not used in the supported deployment flow.
 
 A component diagram showing the component's internal structure and dependencies is given below:
 
@@ -72,16 +72,13 @@ graph TD
     end
 
     subgraph External ["External"]
-        BLOCKLIST["/opt/secure/Apparmor_blocklist\n(writable override file)"]
         PARSER["/sbin/apparmor_parser"]
         KERNEL["Linux Kernel AppArmor LSM"]
         T2["Telemetry 2.0 (t2ValNotify)"]
     end
 
     SVC -->|ExecStart| SH
-    SH -->|Reads| BLOCKLIST
-    SH -->|"apparmor_parser -rWC"| PARSER
-    SH -->|"apparmor_parser -rW[B]"| PARSER
+    SH -->|"Loads generated binary profiles"| PARSER
     PARSER -->|Loads| KERNEL
     GENERIC -->|Read by| PARSER
     CATCHALL -->|Read by| PARSER
@@ -91,7 +88,7 @@ graph TD
 ### Threading Model
 
 - **Threading Architecture**: Single-threaded. `apparmor_parse.sh` is a shell script executed once as a systemd oneshot service. `apparmor_cicd.py` is a single-threaded Python program.
-- **Main Thread**: Sequential execution — read blocklist, read defaults, build lists, invoke `apparmor_parser`, read sysfs, emit telemetry.
+- **Main Thread**: Sequential execution — read build-time defaults, load generated binary profiles, read sysfs, emit telemetry.
 - **Synchronization**: Systemd service ordering (`Before=lighttpd.service`, `WantedBy=local-fs.target`) ensures profiles are loaded before `lighttpd.service` starts; other services must be ordered after `apparmor.service` by the platform/integration to guarantee the same.
 - **Execution model**: Sequential oneshot — the service runs to completion at boot and exits after profile loading is done.
 
@@ -99,13 +96,13 @@ graph TD
 
 ## Design
 
-The component separates policy from mechanism. Profile files in `generic_profiles/` contain only AppArmor policy rules and are independent of the loading logic. `apparmor_parse.sh` contains all loading and mode-resolution logic, keeping policy rules strictly in the profile files. This allows profile files to be updated in source control without touching the startup script, and vice versa. The blocklist file provides a runtime escape hatch for operators to adjust enforcement without modifying read-only filesystem content.
+The component separates policy from mechanism. Profile sources in `generic_profiles/` contain only AppArmor policy rules and are independent of the loading logic. The image build converts these sources to binary profiles, while `apparmor_parse.sh` loads the generated binaries at startup. This keeps policy rules in source control while avoiding target-side compilation. Legacy blocklist handling remains in the script but is not part of the supported deployment flow.
 
-Mode resolution gives the blocklist priority over the defaults file. For each `process:mode` entry read from `/etc/apparmor/apparmor_defaults`, the script checks whether the process has an entry in `/opt/secure/Apparmor_blocklist`. If an override exists and is valid, the override mode takes effect. If not, the defaults-file mode applies. The result per process is one of: added to `complain_list[]`, added to `enforce_list[]`, or skipped (disabled). Both lists are passed to `apparmor_parser` as single batch invocations — `apparmor_parser -rWC` for complain mode and `apparmor_parser -rW[B]` for enforce mode — to minimise the number of parser invocations at startup.
+The image build determines the effective mode for each process from `/etc/apparmor/apparmor_defaults` and generates the corresponding binary profiles. At boot, `apparmor_parse.sh` loads those generated binaries; no runtime blocklist override is used. This avoids target-side profile compilation and keeps boot-time work focused on loading the prebuilt policies.
 
-Northbound interaction is via systemd service ordering only. Profiles are loaded once at boot; runtime mode changes take effect on the next service restart via the blocklist file. Southbound, the only interaction is via `/sbin/apparmor_parser` and the kernel sysfs path at `/sys/kernel/security/apparmor/`.
+Northbound interaction is via systemd service ordering only. Profiles are generated during the image build and loaded once at boot; mode changes require a new image. Southbound, the only interaction is via `/sbin/apparmor_parser` and the kernel sysfs path at `/sys/kernel/security/apparmor/`.
 
-Runtime configuration persistence is limited to `/opt/secure/Apparmor_blocklist`. This file is created empty by `apparmor_parse.sh` via `touch` if it does not exist. Profile files and the defaults file reside in the read-only rootfs and remain unchanged at runtime. The only persistent configuration mechanism is this single plain text file in writable storage.
+Profile configuration is build-time only. Profile sources, generated binaries, and `/etc/apparmor/apparmor_defaults` are packaged in the image and remain unchanged at runtime; no supported persistent runtime override file is used.
 
 ### Component Diagram
 
@@ -116,7 +113,7 @@ graph TD
     subgraph ComponentBoundary ["rdk-apparmor-profiles"]
         subgraph StartupLayer ["Startup Layer"]
             SVC["apparmor.service\nBefore=lighttpd.service\nWantedBy=local-fs.target\nConditionSecurity=apparmor\nConditionPathExists=/etc/apparmor.d\nAssertPathIsReadWrite=.../apparmor/.load\nDefaultDependencies=no\nRemainAfterExit=yes"]
-            SH["apparmor_parse.sh\nReads Apparmor_blocklist + apparmor_defaults\nBuilds complain_list[] and enforce_list[]\nCalls apparmor_parser\nReads /sys/kernel/security/apparmor/profiles\nCalls t2ValNotify"]
+            SH["apparmor_parse.sh\nReads build-time apparmor_defaults\nLoads generated binary profiles\nReads /sys/kernel/security/apparmor/profiles\nCalls t2ValNotify"]
         end
         subgraph PolicyLayer ["Policy Layer"]
             PROFILES["generic_profiles/\n(one file per daemon, flags=attach_disconnected)"]
@@ -131,8 +128,7 @@ graph TD
     end
 
     SVC -->|ExecStart| SH
-    SH -->|"apparmor_parser -rWC (complain batch)"| PARSER
-    SH -->|"apparmor_parser -rW[B] (enforce batch)"| PARSER
+    SH -->|"Loads generated binary profiles"| PARSER
     PROFILES -->|"Input file paths"| PARSER
     DEFAULT_PROF -->|"Input file paths"| PARSER
     PARSER --> KERNEL
@@ -143,17 +139,17 @@ graph TD
 
 ## Internal Modules
 
-| Module / Class                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                      | Key Files                                                                                 |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| `apparmor.service`             | Systemd oneshot service unit. Declares startup guards (`ConditionSecurity=apparmor`, `ConditionPathExists=/etc/apparmor.d`, `AssertPathIsReadWrite=/sys/kernel/security/apparmor/.load`), ordering (`Before=lighttpd.service`, `WantedBy=local-fs.target`), `DefaultDependencies=no`, `RemainAfterExit=yes`, and invokes `apparmor_parse.sh` as `ExecStart`.                                                                                     | `apparmor.service`                                                                        |
-| `apparmor_parse.sh`            | Shell script that reads `/opt/secure/Apparmor_blocklist` and `/etc/apparmor/apparmor_defaults`, validates entries via regex, resolves effective mode per process, builds `complain_list[]` and `enforce_list[]`, calls `apparmor_parser`, reads `/sys/kernel/security/apparmor/profiles`, writes to `/opt/logs/startup_stdout_log.txt`, and calls `t2ValNotify`. Sources `/lib/rdk/apparmor_utils.sh` and `/lib/rdk/t2Shared_api.sh` if present. | `apparmor_parse.sh`                                                                       |
-| `generic_profiles/`            | Per-daemon AppArmor profile files. Each defines one named profile with `flags=(attach_disconnected)` and explicit allow rules for files, capabilities, network, signal, ptrace, dbus, and unix. Some profiles may optionally include `#include if exists "/etc/apparmor.d/vendor/<name>"`.                                                                                                                                                       | `generic_profiles/usr.bin.*`, `generic_profiles/usr.sbin.*`, `generic_profiles/usr.lib.*` |
-| `generic_profiles/default`     | Named profile `default` attached to `/**`. Grants `capability`, `network`, `mount`, `remount`, `umount`, `pivot_root`, `ptrace`, `signal`, `dbus`, `unix`, `/{,**} mrwlk`, `/{,**} pix`, `change_profile -> **`. Explicitly denies writes to `/sys/f[^s]*/**`, `/sys/firmware/**`, selected `/proc/sys/kernel/` paths, `/proc/sysrq-trigger rwklx`, `/proc/kcore rwklx`.                                                                         | `generic_profiles/default`                                                                |
-| `apparmor_generic_profile`     | Three-entry defaults file listing the minimal enforce set shipped in the repository: `default:enforce`, `audiocapturemgr:enforce`, `lighttpd:enforce`.                                                                                                                                                                                                                                                                                           | `apparmor_generic_profile`                                                                |
-| `default`                      | One-line file listing the default Linux capabilities: `capability chown dac_read_search fowner fsetid kill ipc_lock sys_nice setpcap ipc_owner sys_ptrace sys_chroot net_bind_service net_admin sys_resource,`.                                                                                                                                                                                                                                  | `default`                                                                                 |
-| `SecurityCheckRule`            | Python class. Each instance holds a violation rule: `objtype`, `name` (unique string), `rule` (two-element tuple: `(CheckType, CheckData)`), `msg`, `raw` (bool), `priority` (`"High"`, `"Medium"`, `"Low"`). `checkRule()` performs either raw regex match or typed permission-character match depending on `raw` and `objtype`. `getProfileType()` identifies rule type from first token.                                                      | `apparmor_cicd.py`                                                                        |
-| `SecurityCheck`                | Python class. Runs all `check_list` entries against one profile file. `skip_list` excludes lines starting with `{`, `}`, `#include`, `profile `. Tracks violations in `self.violations` list and `self.violation_dict` (keyed `"<rule_name>:<line>"`). Implements `checkExceptions()` against `exception_list` (empty in current source).                                                                                                        | `apparmor_cicd.py`                                                                        |
-| `apparmor_violation_check.yml` | GitHub Actions workflow, triggered on pull requests (paths-ignore: `**/*.sh`, `**/*.md`, `**/*.conf`). Within the job, non-profile files are skipped; for each changed file that contains a `profile` header, it runs `python3 ./apparmor_cicd.py -f <new_file> -a <old_file> -N <repo_path>` and fails CI if new violations are introduced (non-zero exit) or output matches `Total violations found in file: [1-9][0-9]*`.                     | `.github/workflows/apparmor_violation_check.yml`                                          |
+| Module / Class                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                    | Key Files                                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `apparmor.service`             | Systemd oneshot service unit. Declares startup guards (`ConditionSecurity=apparmor`, `ConditionPathExists=/etc/apparmor.d`, `AssertPathIsReadWrite=/sys/kernel/security/apparmor/.load`), ordering (`Before=lighttpd.service`, `WantedBy=local-fs.target`), `DefaultDependencies=no`, `RemainAfterExit=yes`, and invokes `apparmor_parse.sh` as `ExecStart`.                                                                                   | `apparmor.service`                                                                        |
+| `apparmor_parse.sh`            | Shell script that reads `/etc/apparmor/apparmor_defaults`, loads the generated binary profiles, reads `/sys/kernel/security/apparmor/profiles`, writes to `/opt/logs/startup_stdout_log.txt`, and calls `t2ValNotify`. Legacy blocklist and mode-resolution handling remains in the source for compatibility but is not used in the supported deployment flow. Sources `/lib/rdk/apparmor_utils.sh` and `/lib/rdk/t2Shared_api.sh` if present. | `apparmor_parse.sh`                                                                       |
+| `generic_profiles/`            | Per-daemon AppArmor profile files. Each defines one named profile with `flags=(attach_disconnected)` and explicit allow rules for files, capabilities, network, signal, ptrace, dbus, and unix. Some profiles may optionally include `#include if exists "/etc/apparmor.d/vendor/<name>"`.                                                                                                                                                     | `generic_profiles/usr.bin.*`, `generic_profiles/usr.sbin.*`, `generic_profiles/usr.lib.*` |
+| `generic_profiles/default`     | Named profile `default` attached to `/**`. Grants `capability`, `network`, `mount`, `remount`, `umount`, `pivot_root`, `ptrace`, `signal`, `dbus`, `unix`, `/{,**} mrwlk`, `/{,**} pix`, `change_profile -> **`. Explicitly denies writes to `/sys/f[^s]*/**`, `/sys/firmware/**`, selected `/proc/sys/kernel/` paths, `/proc/sysrq-trigger rwklx`, `/proc/kcore rwklx`.                                                                       | `generic_profiles/default`                                                                |
+| `apparmor_generic_profile`     | Three-entry defaults file listing the minimal enforce set shipped in the repository: `default:enforce`, `audiocapturemgr:enforce`, `lighttpd:enforce`.                                                                                                                                                                                                                                                                                         | `apparmor_generic_profile`                                                                |
+| `default`                      | One-line file listing the default Linux capabilities: `capability chown dac_read_search fowner fsetid kill ipc_lock sys_nice setpcap ipc_owner sys_ptrace sys_chroot net_bind_service net_admin sys_resource,`.                                                                                                                                                                                                                                | `default`                                                                                 |
+| `SecurityCheckRule`            | Python class. Each instance holds a violation rule: `objtype`, `name` (unique string), `rule` (two-element tuple: `(CheckType, CheckData)`), `msg`, `raw` (bool), `priority` (`"High"`, `"Medium"`, `"Low"`). `checkRule()` performs either raw regex match or typed permission-character match depending on `raw` and `objtype`. `getProfileType()` identifies rule type from first token.                                                    | `apparmor_cicd.py`                                                                        |
+| `SecurityCheck`                | Python class. Runs all `check_list` entries against one profile file. `skip_list` excludes lines starting with `{`, `}`, `#include`, `profile `. Tracks violations in `self.violations` list and `self.violation_dict` (keyed `"<rule_name>:<line>"`). Implements `checkExceptions()` against `exception_list` (empty in current source).                                                                                                      | `apparmor_cicd.py`                                                                        |
+| `apparmor_violation_check.yml` | GitHub Actions workflow, triggered on pull requests (paths-ignore: `**/*.sh`, `**/*.md`, `**/*.conf`). Within the job, non-profile files are skipped; for each changed file that contains a `profile` header, it runs `python3 ./apparmor_cicd.py -f <new_file> -a <old_file> -N <repo_path>` and fails CI if new violations are introduced (non-zero exit) or output matches `Total violations found in file: [1-9][0-9]*`.                   | `.github/workflows/apparmor_violation_check.yml`                                          |
 
 ```mermaid
 flowchart TD
@@ -174,9 +170,9 @@ flowchart TD
 
 ## Prerequisites & Dependencies
 
-- [x] **Persistent store**: `/opt/secure/Apparmor_blocklist` is the only persistent file. It is read via shell `read` and created via `touch`.
+- [x] **Build-time policy store**: Profile sources, generated binaries, and `/etc/apparmor/apparmor_defaults` are packaged in the image; no runtime profile override file is used.
 - [x] **Systemd services**: `apparmor.service` declares `Before=lighttpd.service`.
-- [x] **Configuration files**: `/etc/apparmor/apparmor_defaults` and `/opt/secure/Apparmor_blocklist` are read via `while IFS=: read -r process mode` in `apparmor_parse.sh`. `/etc/apparmor.d` existence is verified via `ConditionPathExists`.
+- [x] **Configuration files**: `/etc/apparmor/apparmor_defaults` is supplied at image build time. `/etc/apparmor.d` existence is verified via `ConditionPathExists`.
 
 ### Platform Requirements
 
@@ -186,7 +182,6 @@ flowchart TD
   - `/etc/apparmor/apparmor_defaults` — required; lists process names and default modes.
   - `/etc/apparmor.d` — directory must exist (`ConditionPathExists=/etc/apparmor.d`).
   - `/etc/apparmor/binprofiles/` — glob base directory for enforce-mode profile paths (hardcoded as `PROFILES_DIR="/etc/apparmor/binprofiles/*/"`).
-  - `/opt/secure/Apparmor_blocklist` — optional at startup; created empty by `touch` if absent.
   - `/lib/rdk/apparmor_utils.sh` — optional; sourced with `if [ -f /lib/rdk/apparmor_utils.sh ]`.
   - `/lib/rdk/t2Shared_api.sh` — optional; sourced with `if [ -f /lib/rdk/t2Shared_api.sh ]`.
 - **Startup Order**: `local-fs.target` → `apparmor.service` → `lighttpd.service`. `DefaultDependencies=no` disables implicit systemd ordering.
@@ -198,7 +193,7 @@ flowchart TD
 
 ### 1. Install profiles
 
-Profile files from `generic_profiles/` are installed into `/etc/apparmor/binprofiles/*/` (enforce-mode paths) and `/etc/apparmor.d/` (complain-mode paths) as part of the RDK image build. `apparmor.service` is installed into the systemd unit directory.
+Profile sources from `generic_profiles/` are converted to binary profiles during the RDK image build and installed into the runtime profile locations: `/etc/apparmor/binprofiles/*/` for enforce-mode paths and `/etc/apparmor.d/` for complain-mode paths. `apparmor.service` is installed into the systemd unit directory; no profile compilation is performed during boot.
 
 ### 2. Enable and start the service
 
@@ -214,20 +209,7 @@ systemctl start apparmor.service
 cat /sys/kernel/security/apparmor/profiles
 ```
 
-### 4. Override a profile mode at runtime
-
-```bash
-# Change a process to complain mode
-echo "WPEFramework:complain" >> /opt/secure/Apparmor_blocklist
-
-# Disable a profile for a process
-echo "audiocapturemgr:disable" >> /opt/secure/Apparmor_blocklist
-
-# Reload with new overrides
-systemctl restart apparmor.service
-```
-
-### 5. Check startup log output
+### 4. Check startup log output
 
 ```bash
 grep -i apparmor /opt/logs/startup_stdout_log.txt
@@ -239,47 +221,29 @@ grep -i apparmor /opt/logs/startup_stdout_log.txt
 
 ### Configuration Priority
 
-Mode resolution order (lowest to highest precedence):
-
-1. `apparmor_generic_profile` — minimal defaults in repository (`default:enforce`, `audiocapturemgr:enforce`, `lighttpd:enforce`)
-2. `/etc/apparmor/apparmor_defaults` — rootfs defaults file, set at image build time
-3. `/opt/secure/Apparmor_blocklist` — operator-writable runtime override file
+Profile modes are resolved at image build time. The build uses `apparmor_generic_profile` as the minimal default set and `/etc/apparmor/apparmor_defaults` as the image-specific defaults, then generates the binary profiles loaded at boot. No runtime blocklist override is used.
 
 ### Key Configuration Files
 
-| Configuration File                      | Purpose                                                                                                                                                                     | Override Mechanism                                                  |
-| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `/etc/apparmor/apparmor_defaults`       | Lists each process and its default enforcement mode. Format: `process:mode` per line. Read by `apparmor_parse.sh` at service start.                                         | Replace at image build; use Apparmor_blocklist for runtime override |
-| `/opt/secure/Apparmor_blocklist`        | Operator-writable file that overrides mode per process. Format: `process:mode` per line. Valid modes: `enforce`, `complain`, `disable`. Created empty by `touch` if absent. | Direct file write; takes effect on next `apparmor.service` restart  |
-| `/etc/apparmor.d/vendor/usr.bin.<name>` | Optional vendor-specific profile extension. Included via `#include if exists` in each generic profile.                                                                      | Deploy file at the include path                                     |
+| Configuration File                      | Purpose                                                                                                                                            | Override Mechanism              |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| `/etc/apparmor/apparmor_defaults`       | Lists each process and its default enforcement mode. Format: `process:mode` per line. Consumed during the image build to generate binary profiles. | Replace during the image build  |
+| `/etc/apparmor.d/vendor/usr.bin.<name>` | Optional vendor-specific profile extension. Included via `#include if exists` in each generic profile.                                             | Deploy file at the include path |
 
 ### Configuration Parameters
 
-| Parameter        | Location                          | Valid Values                             | Description                                                             |
-| ---------------- | --------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------- |
-| `process:mode`   | `/etc/apparmor/apparmor_defaults` | `enforce`, `complain`                    | Default enforcement mode for the named process                          |
-| `process:mode`   | `/opt/secure/Apparmor_blocklist`  | `enforce`, `complain`, `disable`         | Runtime override of mode for the named process                          |
-| `PROFILES_DIR`   | `apparmor_parse.sh` (hardcoded)   | `/etc/apparmor/binprofiles/*/`           | Glob base used to build enforce-mode profile paths                      |
-| `PARSER`         | `apparmor_parse.sh` (hardcoded)   | `/sbin/apparmor_parser`                  | Path to the `apparmor_parser` binary                                    |
-| `profile_binary` | `apparmor_parse.sh` (hardcoded)   | `true`                                   | When `true`, appends `-B` (binary cache) to the enforce-mode invocation |
-| `RDKLOGS`        | `apparmor_parse.sh` (hardcoded)   | `/opt/logs/startup_stdout_log.txt`       | Path for startup log output                                             |
-| `SYSFS_AA_PATH`  | `apparmor_parse.sh` (hardcoded)   | `/sys/kernel/security/apparmor/profiles` | Kernel sysfs path read after profile load                               |
-
-### Runtime Configuration
-
-Profile mode can be changed at runtime by writing to the blocklist and restarting the service:
-
-```bash
-# Syntax: process_name:mode
-# Valid modes: enforce, complain, disable
-
-echo "tr69hostif:complain" >> /opt/secure/Apparmor_blocklist
-systemctl restart apparmor.service
-```
+| Parameter        | Location                          | Valid Values                             | Description                                                                       |
+| ---------------- | --------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
+| `process:mode`   | `/etc/apparmor/apparmor_defaults` | `enforce`, `complain`                    | Build-time enforcement mode for the named process                                 |
+| `PROFILES_DIR`   | `apparmor_parse.sh` (hardcoded)   | `/etc/apparmor/binprofiles/*/`           | Glob base used to build enforce-mode profile paths                                |
+| `PARSER`         | `apparmor_parse.sh` (hardcoded)   | `/sbin/apparmor_parser`                  | Path to the `apparmor_parser` binary                                              |
+| `profile_binary` | `apparmor_parse.sh` (legacy)      | `true`                                   | Legacy parser flag; deployed profiles are converted to binary at image build time |
+| `RDKLOGS`        | `apparmor_parse.sh` (hardcoded)   | `/opt/logs/startup_stdout_log.txt`       | Path for startup log output                                                       |
+| `SYSFS_AA_PATH`  | `apparmor_parse.sh` (hardcoded)   | `/sys/kernel/security/apparmor/profiles` | Kernel sysfs path read after profile load                                         |
 
 ### Configuration Persistence
 
-`/opt/secure/Apparmor_blocklist` persists across reboots as it resides in writable storage. Entries written to this file apply on every subsequent `apparmor.service` start. Profile files and `apparmor_defaults` reside in the read-only rootfs and are updated through the image build process.
+Profile configuration is generated during the image build and packaged in the image. Generated binaries and `apparmor_defaults` remain unchanged at runtime; there is no supported persistent runtime mode override.
 
 ---
 
@@ -287,7 +251,7 @@ systemctl restart apparmor.service
 
 ### Interface Type
 
-`rdk-apparmor-profiles` is a systemd oneshot service. Its sole external interaction point is `/opt/secure/Apparmor_blocklist`, a plain text file read at service start. The service interface is entirely file-based.
+`rdk-apparmor-profiles` is a systemd oneshot service. Its profile inputs are packaged during the image build, and its runtime interaction is limited to loading the generated binaries and emitting telemetry.
 
 ### Events / Notifications
 
@@ -309,7 +273,6 @@ flowchart TD
 
     subgraph FilesystemInputs ["Filesystem Inputs"]
         DEFAULTS["/etc/apparmor/apparmor_defaults"]
-        BLOCKLIST["/opt/secure/Apparmor_blocklist"]
         PROFILES_DIR["/etc/apparmor/binprofiles/"]
         APPARMOURD["/etc/apparmor.d/"]
     end
@@ -327,9 +290,7 @@ flowchart TD
 
     SYSTEMD -->|"Activates (local-fs.target)"| AppArmorService
     PARSE -->|"while IFS=: read"| DEFAULTS
-    PARSE -->|"while IFS=: read"| BLOCKLIST
-    PARSE -->|"apparmor_parser -rWC"| PARSER
-    PARSE -->|"apparmor_parser -rW[B]"| PARSER
+    PARSE -->|"Loads generated binary profiles"| PARSER
     PROFILES_DIR -->|"Glob expanded paths"| PARSER
     APPARMOURD -->|"Complain-mode paths"| PARSER
     PARSER -->|"Loads profiles"| KERNEL
@@ -344,7 +305,7 @@ flowchart TD
 | Target Component / Layer     | Interaction Purpose                                                                      | Key Commands / Paths                                                                           |
 | ---------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | **Platform**                 |                                                                                          |                                                                                                |
-| `/sbin/apparmor_parser`      | Compiles and loads AppArmor profiles into the kernel                                     | `apparmor_parser -rWC <complain_list>`, `apparmor_parser -rW[B] <enforce_list>`                |
+| `/sbin/apparmor_parser`      | Loads the build-time generated binary AppArmor profiles into the kernel                  | `apparmor_parser` with generated binary profile inputs                                         |
 | Linux Kernel AppArmor LSM    | Stores and enforces loaded profiles for the lifetime of the system session               | `/sys/kernel/security/apparmor/.load`, `/sys/kernel/security/apparmor/profiles`                |
 | **RDK Runtime Libraries**    |                                                                                          |                                                                                                |
 | `/lib/rdk/t2Shared_api.sh`   | Provides `t2ValNotify`. Sourced if file exists at service start                          | `source /lib/rdk/t2Shared_api.sh`                                                              |
@@ -381,23 +342,10 @@ sequenceDiagram
     Note over SVC: AssertPathIsReadWrite=.../apparmor/.load
     SVC->>SH: ExecStart
 
-    SH->>FS: while IFS=: read /opt/secure/Apparmor_blocklist
-    Note over SH: Validate mode and process name with regex
-    Note over SH: Store block_modes_<process> via eval
-
     SH->>FS: while IFS=: read /etc/apparmor/apparmor_defaults
-    Note over SH: Resolve effective mode per process
-    Note over SH: Build complain_list[] and enforce_list[]
-
-    alt complain_list non-empty
-        SH->>PARSER: apparmor_parser -rWC joined_complain_paths
-        PARSER->>KERNEL: Load complain-mode profiles
-    end
-
-    alt enforce_list non-empty
-        SH->>PARSER: apparmor_parser -rW[B] joined_enforce_paths
-        PARSER->>KERNEL: Load enforce-mode profiles
-    end
+    Note over SH: Profiles were converted to binary during the image build
+    SH->>PARSER: Load generated binary profiles
+    PARSER->>KERNEL: Load prebuilt policies
 
     SH->>KERNEL: cat /sys/kernel/security/apparmor/profiles
     Note over SH: Count and collect complain/enforce entries
@@ -425,17 +373,10 @@ sequenceDiagram
     Note over SVC: State: Condition evaluation
 
     SVC->>SH: ExecStart=/etc/apparmor/apparmor_parse.sh
-    Note over SH: State: Reading Apparmor_blocklist
+    Note over SH: State: Loading build-time generated binary profiles
 
-    Note over SH: State: Reading apparmor_defaults and resolving modes
-
-    Note over SH: State: Building complain_list[] and enforce_list[]
-
-    SH->>KERNEL: apparmor_parser -rWC (complain batch)
-    Note over KERNEL: Complain-mode profiles active
-
-    SH->>KERNEL: apparmor_parser -rW[B] (enforce batch)
-    Note over KERNEL: Enforce-mode profiles active
+    SH->>KERNEL: Load prebuilt AppArmor policies
+    Note over KERNEL: Profiles active in configured modes
 
     Note over SH: State: Telemetry — read sysfs, call t2ValNotify
 
@@ -448,7 +389,7 @@ sequenceDiagram
 
 Once `apparmor.service` completes, AppArmor policies are enforced by the kernel for the duration of the session. The oneshot service exits after profile loading; the kernel LSM takes over all subsequent enforcement.
 
-**Blocklist override takes effect**: A new entry written to `/opt/secure/Apparmor_blocklist` takes effect on the next `apparmor.service` restart. On restart, `apparmor_parse.sh` re-reads both files and reloads all profiles.
+**Profile changes take effect at image build time**: Changes to profile sources or default modes require regenerating the binary profiles and deploying a new image. The runtime service only loads the packaged policies.
 
 **Kernel enforcement**: If a profiled process attempts an access not listed in its profile, the kernel denies it (enforce mode) or logs it (complain mode). Per-access enforcement is handled entirely by the kernel LSM at runtime.
 
@@ -462,30 +403,17 @@ Once `apparmor.service` completes, AppArmor policies are enforced by the kernel 
 sequenceDiagram
     participant SYSTEMD as systemd
     participant SH as apparmor_parse.sh
-    participant BLOCKLIST as /opt/secure/Apparmor_blocklist
     participant DEFAULTS as /etc/apparmor/apparmor_defaults
     participant PARSER as /sbin/apparmor_parser
     participant KERNEL as Kernel AppArmor LSM
 
     SYSTEMD->>SH: Execute (ExecStart)
 
-    SH->>BLOCKLIST: while IFS=: read -r process mode
-    Note over SH: Validate mode =~ disable|complain|enforce
-    Note over SH: Validate process =~ ^[[:alnum:]_.-]+$
-    Note over SH: eval "block_modes_${process//./_}=${mode}"
-
     SH->>DEFAULTS: while IFS=: read -r process mode
-    Note over SH: Per process: lookup blocklist override
-    Note over SH: enforce + blocklist=complain → complain_list
-    Note over SH: enforce + blocklist not disable → enforce_list
-    Note over SH: complain + blocklist not disable → complain_list
+    Note over SH: Modes resolved and profiles converted during image build
 
-    SH->>PARSER: apparmor_parser -rWC ${complain_list[*]}
-    PARSER->>KERNEL: Load complain-mode profiles
-    KERNEL-->>PARSER: Done
-
-    SH->>PARSER: apparmor_parser -rW[B] ${enforce_list[*]}
-    PARSER->>KERNEL: Load enforce-mode profiles
+    SH->>PARSER: Load generated binary profiles
+    PARSER->>KERNEL: Load prebuilt policies
     KERNEL-->>PARSER: Done
 
     SH-->>SYSTEMD: Exit 0
@@ -497,11 +425,11 @@ sequenceDiagram
 
 ### Key Implementation Logic
 
-- **Input validation**: Before calling `eval` to set shell variables from the blocklist, `apparmor_parse.sh` validates the mode with `[[ ! "$mode" =~ disable|complain|enforce ]]` and the process name with `[[ ! $process =~ ^[[:alnum:]_.-]+$ ]]`. The same process name pattern is applied to entries in the defaults file. Entries failing either check are skipped with a printed message.
+- **Build-time validation**: Profile modes and source policy are validated during the image build before binary profiles are generated. The deployed service loads the resulting binaries.
 
-- **Batch loading**: All complain-mode profile paths are collected into the `complain_list` array and joined with `IFS=" "` before a single `apparmor_parser -rWC` invocation. All enforce-mode paths are collected into `enforce_list` and passed to a single `apparmor_parser -rW[B]` invocation. This results in at most two `apparmor_parser` calls regardless of the number of profiles.
+- **Binary loading**: All profiles are converted to binary form during the image build. At boot, `apparmor.service` loads the generated binaries, avoiding target-side parsing and compilation.
 
-- **Binary profiles (binary cache)**: When `apparmor_parser` is invoked with the `-B` flag, it compiles the text profile source and writes a pre-compiled binary representation to its configured cache directory. On subsequent loads, if a valid binary cache file exists and is newer than the source, the parser loads the binary directly rather than re-parsing the text source. This significantly reduces startup time when many profiles are present, because binary loading skips the parse and compile phase. The enforce invocation conditionally appends `-B` using `$($profile_binary && echo "B")`. The variable `profile_binary` is set to `true` at the top of `apparmor_parse.sh`.
+- **Binary profiles**: Profile sources are converted to binary form during the image build for boot-up optimization. The target does not perform the normal profile compilation step at service start.
 
 - **Telemetry**: After loading, `apparmor_parse.sh` reads `/sys/kernel/security/apparmor/profiles`, filters for `complain` and `enforce` lines with `grep`, counts with `wc -l`, and joins process names with `tr '\n' ','`. The result is written to `/opt/logs/startup_stdout_log.txt` via `echo ... >> $RDKLOGS` and passed to `t2ValNotify`.
 
@@ -526,23 +454,15 @@ sequenceDiagram
 [apparmor.service activated — ConditionSecurity, ConditionPathExists, AssertPathIsReadWrite evaluated]
         |
         v
-[apparmor_parse.sh reads /opt/secure/Apparmor_blocklist line-by-line
- — validate mode and process name, store as shell variables via eval]
-        |
-        v
-[apparmor_parse.sh reads /etc/apparmor/apparmor_defaults line-by-line
- — per-process mode resolution against blocklist variables]
-        |
-        v
-[Mode resolution output: complain_list[] and enforce_list[] arrays]
-        |
-        v
-[apparmor_parser -rWC complain_list
- — complain-mode profiles compiled and loaded into kernel]
-        |
-        v
-[apparmor_parser -rW[B] enforce_list
- — enforce-mode profiles compiled and loaded into kernel]
+[Image build reads /etc/apparmor/apparmor_defaults
+ — resolves profile modes and converts profile sources to binary]
+    |
+    v
+[apparmor.service activates at boot]
+    |
+    v
+[apparmor_parse.sh loads generated binary profiles
+ — no target-side profile compilation]
         |
         v
 [Read /sys/kernel/security/apparmor/profiles
@@ -566,10 +486,7 @@ sequenceDiagram
 
 | Layer                                  | Error Condition                                                                 | Handling Strategy                                                                                   |
 | -------------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Input validation (`apparmor_parse.sh`) | Invalid mode value in blocklist (`!~ disable\|complain\|enforce`)               | Print `"Invalid blocklist mode for process $process, ignoring"`, skip entry                         |
-| Input validation (`apparmor_parse.sh`) | Invalid process name in blocklist (`!~ ^[[:alnum:]_.-]+$`)                      | Print `"Process blocklist name is invalid, ignoring"`, skip entry                                   |
-| Input validation (`apparmor_parse.sh`) | Invalid process name in defaults file                                           | Print `"Process defaults name is invalid, ignoring"`, skip entry                                    |
-| Input validation (`apparmor_parse.sh`) | Invalid generated variable name (eval guard)                                    | Print `"Var name is invalid, ignoring"`, skip entry                                                 |
+| Image build validation                 | Invalid profile source or mode                                                  | Binary profile generation fails and the image build must be corrected                               |
 | Systemd condition (`apparmor.service`) | `ConditionSecurity=apparmor` false — AppArmor not enabled in kernel             | Service skips silently; no profiles are loaded                                                      |
 | Systemd condition (`apparmor.service`) | `ConditionPathExists=/etc/apparmor.d` false                                     | Service skips silently                                                                              |
 | Systemd assertion (`apparmor.service`) | `AssertPathIsReadWrite=/sys/kernel/security/apparmor/.load` fails               | Service activation fails                                                                            |
@@ -584,13 +501,12 @@ sequenceDiagram
 
 ### Test Levels
 
-| Level                         | Scope                                                                                                      | Location                                                              |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| CI – Violation scan           | Detects security violations in changed profile files on every pull request                                 | `.github/workflows/apparmor_violation_check.yml` + `apparmor_cicd.py` |
-| Manual – Service start        | Verify `apparmor.service` activates and profiles appear in `/sys/kernel/security/apparmor/profiles`        | Target device                                                         |
-| Manual – Enforce verification | Attempt a filesystem access denied by a profile; verify kernel audit log entry                             | Target device                                                         |
-| Manual – Blocklist override   | Write an entry to `/opt/secure/Apparmor_blocklist`, restart service, verify mode change in sysfs           | Target device                                                         |
-| Manual – Complain mode        | Set a process to complain in blocklist, attempt a denied operation, verify logged-but-not-denied behaviour | Target device                                                         |
+| Level                         | Scope                                                                                                                         | Location                                                              |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| CI – Violation scan           | Detects security violations in changed profile files on every pull request                                                    | `.github/workflows/apparmor_violation_check.yml` + `apparmor_cicd.py` |
+| Manual – Service start        | Verify `apparmor.service` activates and profiles appear in `/sys/kernel/security/apparmor/profiles`                           | Target device                                                         |
+| Manual – Enforce verification | Attempt a filesystem access denied by a profile; verify kernel audit log entry                                                | Target device                                                         |
+| Manual – Complain mode        | Configure a process for complain mode at image build time, attempt a denied operation, verify logged-but-not-denied behaviour | Target device                                                         |
 
 ### Running Tests
 
@@ -614,16 +530,6 @@ grep -i apparmor /opt/logs/startup_stdout_log.txt
 ```bash
 # After service start, check the kernel audit log for denied accesses
 dmesg | grep -i "apparmor.*DENIED"
-```
-
-**Blocklist override test** — change a process to complain mode and verify:
-
-```bash
-echo "WPEFramework:complain" >> /opt/secure/Apparmor_blocklist
-systemctl restart apparmor.service
-# Verify the mode change was applied
-grep WPEFramework /sys/kernel/security/apparmor/profiles
-# Expected output: WPEFramework (complain)
 ```
 
 **Complain mode test** — confirm that a denied operation is logged but not blocked:
