@@ -221,20 +221,20 @@ grep -i apparmor /opt/logs/startup_stdout_log.txt
 
 ### Configuration Priority
 
-Profile modes are read from the packaged `/etc/apparmor/apparmor_defaults` at boot. Enforce-mode inputs use the build-time generated binaries under `PROFILES_DIR`; complain-mode inputs are parsed from `/etc/apparmor.d/` by `apparmor_parse.sh`. No runtime blocklist override is used.
+Profile modes come from `/etc/apparmor/apparmor_defaults`, which is populated during the image build and then read again at boot by `apparmor_parse.sh`. For entries set to `enforce`, the script loads the corresponding build-time generated binaries under `PROFILES_DIR`; for entries set to `complain`, it parses the text profiles from `/etc/apparmor.d/`. No runtime blocklist override is used.
 
 ### Key Configuration Files
 
 | Configuration File                      | Purpose                                                                                                                                            | Override Mechanism              |
 | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| `/etc/apparmor/apparmor_defaults`       | Lists each process and its default enforcement mode. Format: `process:mode` per line. Consumed during the image build to generate binary profiles. | Replace during the image build  |
+| `/etc/apparmor/apparmor_defaults`       | Lists each process and its default enforcement mode. Format: `process:mode` per line. The same defaults are used during the image build to decide which enforce-mode binaries are generated, and the packaged file is read again at boot to select enforce vs. complain loading behavior. | Replace during the image build  |
 | `/etc/apparmor.d/vendor/usr.bin.<name>` | Optional vendor-specific profile extension. Included via `#include if exists` in each generic profile.                                             | Deploy file at the include path |
 
 ### Configuration Parameters
 
 | Parameter        | Location                          | Valid Values                             | Description                                                                       |
 | ---------------- | --------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
-| `process:mode`   | `/etc/apparmor/apparmor_defaults` | `enforce`, `complain`                    | Build-time enforcement mode for the named process                                 |
+| `process:mode`   | `/etc/apparmor/apparmor_defaults` | `enforce`, `complain`                    | Per-process default mode used both at image build time and again at boot to select binary vs. parsed loading |
 | `PROFILES_DIR`   | `apparmor_parse.sh` (hardcoded)   | `/etc/apparmor/binprofiles/*/`           | Glob base used to build enforce-mode profile paths                                |
 | `PARSER`         | `apparmor_parse.sh` (hardcoded)   | `/sbin/apparmor_parser`                  | Path to the `apparmor_parser` binary                                              |
 | `profile_binary` | `apparmor_parse.sh` (legacy)      | `true`                                   | Legacy parser flag; deployed profiles are converted to binary at image build time |
