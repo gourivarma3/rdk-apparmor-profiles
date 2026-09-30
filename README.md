@@ -26,7 +26,7 @@ graph TD
     ApparmorComp -->|"loads build-time binary profiles"| KernelLayer
     KernelLayer -->|"Enforces profiles on"| ThunderLayer
     KernelLayer -->|"Enforces profiles on"| RDKCoreLayer
-    ApparmorComp -->|"t2ValNotify APPARMOR_C_split / APPARMOR_E_split"| Telemetry
+    ApparmorComp -->|"t2ValNotify APPARMOR_C_split: / APPARMOR_E_split:"| Telemetry
 ```
 
 **Key Features & Responsibilities:**
@@ -181,7 +181,7 @@ flowchart TD
 - **Configuration Files**:
   - `/etc/apparmor/apparmor_defaults` — required; lists process names and default modes.
   - `/etc/apparmor.d` — directory must exist (`ConditionPathExists=/etc/apparmor.d`).
-  - `/etc/apparmor/binprofiles/` — glob base directory for enforce-mode profile paths (hardcoded as `PROFILES_DIR="/etc/apparmor/binprofiles/*/"`).
+    - `/etc/apparmor/binprofiles/` — root directory for enforce-mode binary profiles; the hardcoded lookup uses the glob pattern `PROFILES_DIR="/etc/apparmor/binprofiles/*/"`.
   - `/lib/rdk/apparmor_utils.sh` — optional; sourced with `if [ -f /lib/rdk/apparmor_utils.sh ]`.
   - `/lib/rdk/t2Shared_api.sh` — optional; sourced with `if [ -f /lib/rdk/t2Shared_api.sh ]`.
 - **Startup Order**: `local-fs.target` → `apparmor.service` → `lighttpd.service`. `DefaultDependencies=no` disables implicit systemd ordering.
@@ -225,21 +225,21 @@ Profile modes come from `/etc/apparmor/apparmor_defaults`, which is populated du
 
 ### Key Configuration Files
 
-| Configuration File                      | Purpose                                                                                                                                            | Override Mechanism              |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| Configuration File                      | Purpose                                                                                                                                                                                                                                                                                   | Override Mechanism              |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
 | `/etc/apparmor/apparmor_defaults`       | Lists each process and its default enforcement mode. Format: `process:mode` per line. The same defaults are used during the image build to decide which enforce-mode binaries are generated, and the packaged file is read again at boot to select enforce vs. complain loading behavior. | Replace during the image build  |
-| `/etc/apparmor.d/vendor/usr.bin.<name>` | Optional vendor-specific profile extension. Included via `#include if exists` in each generic profile.                                             | Deploy file at the include path |
+| `/etc/apparmor.d/vendor/usr.bin.<name>` | Optional vendor-specific profile extension. Included via `#include if exists` in each generic profile.                                                                                                                                                                                    | Deploy file at the include path |
 
 ### Configuration Parameters
 
-| Parameter        | Location                          | Valid Values                             | Description                                                                       |
-| ---------------- | --------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
+| Parameter        | Location                          | Valid Values                             | Description                                                                                                  |
+| ---------------- | --------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `process:mode`   | `/etc/apparmor/apparmor_defaults` | `enforce`, `complain`                    | Per-process default mode used both at image build time and again at boot to select binary vs. parsed loading |
-| `PROFILES_DIR`   | `apparmor_parse.sh` (hardcoded)   | `/etc/apparmor/binprofiles/*/`           | Glob base used to build enforce-mode profile paths                                |
-| `PARSER`         | `apparmor_parse.sh` (hardcoded)   | `/sbin/apparmor_parser`                  | Path to the `apparmor_parser` binary                                              |
-| `profile_binary` | `apparmor_parse.sh` (legacy)      | `true`                                   | Legacy parser flag; deployed profiles are converted to binary at image build time |
-| `RDKLOGS`        | `apparmor_parse.sh` (hardcoded)   | `/opt/logs/startup_stdout_log.txt`       | Path for startup log output                                                       |
-| `SYSFS_AA_PATH`  | `apparmor_parse.sh` (hardcoded)   | `/sys/kernel/security/apparmor/profiles` | Kernel sysfs path read after profile load                                         |
+| `PROFILES_DIR`   | `apparmor_parse.sh` (hardcoded)   | `/etc/apparmor/binprofiles/*/`           | Glob pattern used to match enforce-mode profile directories when building profile paths                      |
+| `PARSER`         | `apparmor_parse.sh` (hardcoded)   | `/sbin/apparmor_parser`                  | Path to the `apparmor_parser` binary                                                                         |
+| `profile_binary` | `apparmor_parse.sh` (legacy)      | `true`                                   | Legacy parser flag; deployed profiles are converted to binary at image build time                            |
+| `RDKLOGS`        | `apparmor_parse.sh` (hardcoded)   | `/opt/logs/startup_stdout_log.txt`       | Path for startup log output                                                                                  |
+| `SYSFS_AA_PATH`  | `apparmor_parse.sh` (hardcoded)   | `/sys/kernel/security/apparmor/profiles` | Kernel sysfs path read after profile load                                                                    |
 
 ### Configuration Persistence
 
@@ -274,7 +274,7 @@ flowchart TD
     subgraph FilesystemInputs ["Filesystem Inputs"]
         DEFAULTS["/etc/apparmor/apparmor_defaults"]
         PROFILES_DIR["/etc/apparmor/binprofiles/"]
-        APPARMOURD["/etc/apparmor.d/"]
+        APPARMOR_D["/etc/apparmor.d/"]
     end
 
     subgraph FilesystemOutputs ["Filesystem Outputs"]
@@ -292,12 +292,12 @@ flowchart TD
     PARSE -->|"while IFS=: read"| DEFAULTS
     PARSE -->|"Loads generated binary profiles"| PARSER
     PROFILES_DIR -->|"Glob expanded paths"| PARSER
-    APPARMOURD -->|"Complain-mode paths"| PARSER
+    APPARMOR_D -->|"Complain-mode paths"| PARSER
     PARSER -->|"Loads profiles"| KERNEL
     PARSE -->|"grep complain / enforce"| SYSFS
     PARSE -->|"echo ... >>"| RDKLOGS
-    PARSE -->|"t2ValNotify APPARMOR_C_split"| T2
-    PARSE -->|"t2ValNotify APPARMOR_E_split"| T2
+    PARSE -->|"t2ValNotify APPARMOR_C_split:"| T2
+    PARSE -->|"t2ValNotify APPARMOR_E_split:"| T2
 ```
 
 ### Interaction Matrix
